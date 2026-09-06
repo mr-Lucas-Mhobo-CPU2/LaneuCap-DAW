@@ -21,6 +21,8 @@ public:
         juce::Synthesiser synth;
         float volume = 1.0f;
         bool mute = false;
+        float pan = 0.0f; // -1.0 left .. 1.0 right
+        bool solo = false;
     };
 
     static AudioEngine* getInstance();
@@ -43,6 +45,10 @@ public:
     float getChannelVolume(int index) const;
     void setChannelMute(int index, bool m);
     bool getChannelMute(int index) const;
+    void setChannelPan(int index, float pan);
+    float getChannelPan(int index) const;
+    void setChannelSolo(int index, bool s);
+    bool getChannelSolo(int index) const;
 
     // Sequencer
     void addNoteEvent(const NoteEvent& ev);

@@ -161,6 +161,8 @@ int AudioEngine::addChannel()
     Channel ch;
     ch.volume = 1.0f;
     ch.mute = false;
+    ch.pan = 0.0f;
+    ch.solo = false;
     // add 6 voices per channel
     for (int v = 0; v < 6; ++v)
         ch.synth.addVoice(new SimpleVoice());
@@ -202,6 +204,34 @@ bool AudioEngine::getChannelMute(int index) const
     return false;
 }
 
+void AudioEngine::setChannelPan(int index, float pan)
+{
+    juce::ScopedLock sl(lock);
+    if (isPositiveAndBelow(index, channels.size()))
+        channels.getReference(index).pan = juce::jlimit(-1.0f, 1.0f, pan);
+}
+
+float AudioEngine::getChannelPan(int index) const
+{
+    if (isPositiveAndBelow(index, channels.size()))
+        return channels.getReference(index).pan;
+    return 0.0f;
+}
+
+void AudioEngine::setChannelSolo(int index, bool s)
+{
+    juce::ScopedLock sl(lock);
+    if (isPositiveAndBelow(index, channels.size()))
+        channels.getReference(index).solo = s;
+}
+
+bool AudioEngine::getChannelSolo(int index) const
+{
+    if (isPositiveAndBelow(index, channels.size()))
+        return channels.getReference(index).solo;
+    return false;
+}
+
 void AudioEngine::addNoteEvent(const NoteEvent& ev)
 {
     juce::ScopedLock sl(lock);
@@ -229,6 +259,15 @@ void AudioEngine::audioDeviceStopped()
     mixBuffer.setSize(0, 0);
 }
 
+static void computePanGains(float pan, float& leftGain, float& rightGain)
+{
+    // pan -1 = left, 0 = center, 1 = right
+    // use equal-power panning
+    float angle = (pan + 1.0f) * 0.25f * juce::MathConstants<float>::pi; // map [-1,1] to [0, pi/2]
+    leftGain = std::cos(angle);
+    rightGain = std::sin(angle);
+}
+
 void AudioEngine::audioDeviceIOCallback(const float** /*inputChannelData*/, int /*numInputChannels*/,
                                         float** outputChannelData, int numOutputChannels,
                                         int numSamples)
@@ -248,7 +287,6 @@ void AudioEngine::audioDeviceIOCallback(const float** /*inputChannelData*/, int 
 
     if (isPlaying)
     {
-        // current sample index is not tracked globally here; instead compute beats based on a simple running frame counter
         static int64_t totalSamples = 0;
         const double beatStart = totalSamples / samplesPerBeat;
         const double beatEnd = (totalSamples + numSamples) / samplesPerBeat;
@@ -272,9 +310,13 @@ void AudioEngine::audioDeviceIOCallback(const float** /*inputChannelData*/, int 
         totalSamples += numSamples;
     }
 
-    // render each channel into mixBuffer then copy to output with volume
+    // render each channel into mixBuffer then copy to output with volume/pan/solo
     mixBuffer.setSize(numOutputChannels, numSamples);
     mixBuffer.clear();
+
+    // check if any solo active
+    bool anySolo = false;
+    for (auto& ch : channels) if (ch.solo) { anySolo = true; break; }
 
     for (int i = 0; i < channels.size(); ++i)
     {
@@ -285,12 +327,24 @@ void AudioEngine::audioDeviceIOCallback(const float** /*inputChannelData*/, int 
         ch.synth.renderNextBlock(tempBuf, juce::MidiBuffer(), 0, numSamples);
 
         float vol = ch.mute ? 0.0f : ch.volume;
-        for (int c = 0; c < numOutputChannels; ++c)
+        if (anySolo && !ch.solo) vol = 0.0f;
+
+        float leftGain, rightGain;
+        computePanGains(ch.pan, leftGain, rightGain);
+
+        for (int s = 0; s < numSamples; ++s)
         {
-            auto* src = tempBuf.getReadPointer(c);
-            auto* dst = mixBuffer.getWritePointer(c);
-            for (int s = 0; s < numSamples; ++s)
-                dst[s] += src[s] * vol;
+            float sampleL = 0.0f;
+            float sampleR = 0.0f;
+            // if mono output in tempBuf channel 0
+            float inL = tempBuf.getNumChannels() > 0 ? tempBuf.getSample(0, s) : 0.0f;
+            float inR = tempBuf.getNumChannels() > 1 ? tempBuf.getSample(1, s) : inL;
+
+            sampleL = (inL * leftGain + inR * leftGain) * vol;
+            sampleR = (inL * rightGain + inR * rightGain) * vol;
+
+            if (numOutputChannels > 0) mixBuffer.addSample(0, s, sampleL);
+            if (numOutputChannels > 1) mixBuffer.addSample(1, s, sampleR);
         }
     }
 
@@ -316,6 +370,8 @@ bool AudioEngine::saveProject(const juce::File& file)
         juce::DynamicObject::Ptr dob = new juce::DynamicObject();
         dob->setProperty("volume", ch.volume);
         dob->setProperty("mute", ch.mute);
+        dob->setProperty("pan", ch.pan);
+        dob->setProperty("solo", ch.solo);
         chArr.add(juce::var(dob.get()));
     }
     root->setProperty("channels", juce::var(chArr));
@@ -361,6 +417,8 @@ bool AudioEngine::loadProject(const juce::File& file)
                         Channel ch;
                         ch.volume = (float)dob->getProperty("volume");
                         ch.mute = (bool)dob->getProperty("mute");
+                        ch.pan = (float)dob->getProperty("pan");
+                        ch.solo = (bool)dob->getProperty("solo");
                         for (int v = 0; v < 6; ++v) ch.synth.addVoice(new SimpleVoice());
                         ch.synth.addSound(new SimpleSound());
                         channels.add(std::move(ch));

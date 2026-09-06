@@ -4,12 +4,12 @@
 class MixerComponent : public juce::Component
 {
 public:
-    MixerComponent()
-    {
-        addAndMakeVisible(label);
-        label.setText("Mixer", juce::dontSendNotification);
-    }
-    void resized() override { label.setBounds(5,5,getWidth()-10,20); }
+    MixerComponent();
+    void resized() override;
+    void refresh();
+
 private:
-    juce::Label label;
+    juce::OwnedArray<juce::Component> rows;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MixerComponent)
 };
