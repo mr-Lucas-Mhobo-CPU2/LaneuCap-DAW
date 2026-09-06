@@ -1,0 +1,1212 @@
+# apply_laneucap_changes.ps1
+# RUN THIS FROM YOUR REPO ROOT (LaneuCap-DAW)
+# Usage: .\apply_laneucap_changes.ps1
+
+param()
+Set-StrictMode -Version Latest
+
+$branch = "init-juce-daw"
+
+function Write-FileContent($path, $text) {
+    $dir = Split-Path $path -Parent
+    if ($dir -and -not (Test-Path $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+    $text | Out-File -FilePath $path -Encoding UTF8 -Force
+    Write-Host "Wrote $path"
+}
+
+# Files to write
+Write-FileContent ".github/workflows/windows-build.yml" @"
+# GitHub Actions workflow to build LaneuCap DAW on Windows and produce a zip artifact
+name: Windows Build
+
+on:
+  push:
+    branches: [ init-juce-daw, main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup MSYS2 (for Git & CMake)
+        uses: msys2/setup-msys2@v3
+        with:
+          update: true
+
+      - name: Install CMake
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: '3.24.0'
+
+      - name: Configure
+        run: |
+          mkdir build
+          cd build
+          cmake -G "Visual Studio 17 2022" ..
+
+      - name: Build
+        run: |
+          cd build
+          cmake --build . --config Release
+
+      - name: Package
+        run: |
+          cd build
+          $exe = Get-ChildItem -Path . -Filter "*LaneuCapDAW*.exe" -Recurse | Select-Object -First 1
+          if ($exe) {
+            $out = "LaneuCap-Release.zip"
+            Compress-Archive -Path $exe.FullName -DestinationPath $out -Force
+          }
+        shell: powershell
+
+      - name: Upload artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: laneucap-windows-exe
+          path: build/LaneuCap-Release.zip
+"@
+
+Write-FileContent "docs/.nojekyll" @"
+---
+layout: none
+---
+"@
+
+Write-FileContent "src/AudioEngine.h" @"
+#pragma once
+
+#include <JuceHeader.h>
+
+class AudioEngine : private juce::AudioIODeviceCallback
+{
+public:
+    struct NoteEvent
+    {
+        int channel = 0;
+        int midiNote = 60;
+        int velocity = 100;
+        double startBeat = 0.0;
+        double durationBeats = 1.0;
+        bool onSent = false;
+        bool offSent = false;
+    };
+
+    struct Channel
+    {
+        juce::Synthesiser synth;
+        float volume = 1.0f;
+        bool mute = false;
+        float pan = 0.0f; // -1.0 left .. 1.0 right
+        bool solo = false;
+        float meterLevel = 0.0f; // RMS meter value
+    };
+
+    static AudioEngine* getInstance();
+
+    AudioEngine();
+    ~AudioEngine();
+
+    void initialise();
+    void shutdown();
+
+    void start();
+    void stop();
+
+    void setBpm(double b);
+    double getBpm() const;
+
+    int addChannel();
+    bool removeChannel(int index);
+    int getNumChannels() const;
+    void setChannelVolume(int index, float vol);
+    float getChannelVolume(int index) const;
+    void setChannelMute(int index, bool m);
+    bool getChannelMute(int index) const;
+    void setChannelPan(int index, float pan);
+    float getChannelPan(int index) const;
+    void setChannelSolo(int index, bool s);
+    bool getChannelSolo(int index) const;
+    float getChannelLevel(int index) const;
+
+    // Sequencer
+    void addNoteEvent(const NoteEvent& ev);
+    void clearSequence();
+
+    // Project save/load
+    bool saveProject(const juce::File& file);
+    bool loadProject(const juce::File& file);
+
+    // Transport / playhead
+    double getPlayheadBeat() const;
+    void setLoop(bool enabled, double startBeat, double endBeat);
+
+private:
+    void audioDeviceIOCallback(const float** inputChannelData, int numInputChannels,
+                               float** outputChannelData, int numOutputChannels,
+                               int numSamples) override;
+    void audioDeviceAboutToStart(juce::AudioIODevice* device) override;
+    void audioDeviceStopped() override;
+
+    juce::AudioDeviceManager deviceManager;
+    juce::AudioSampleBuffer mixBuffer;
+    bool isPlaying = false;
+
+    double sampleRate = 44100.0;
+    double bpm = 120.0;
+
+    juce::CriticalSection lock;
+    juce::Array<Channel> channels;
+    juce::Array<NoteEvent> sequence;
+
+    int midiChannelForSynth = 1;
+
+    // playhead
+    int64_t totalSamples = 0;
+    bool loopEnabled = false;
+    double loopStartBeat = 0.0;
+    double loopEndBeat = 0.0;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(AudioEngine)
+};
+"@
+
+Write-FileContent "src/AudioEngine.cpp" @"
+#include ""AudioEngine.h""
+
+static AudioEngine* instance = nullptr;
+
+// Simple Synth sound + voice -------------------------------------------------
+
+struct SimpleSound : public juce::SynthesiserSound
+{
+    bool appliesToNote (int) override { return true; }
+    bool appliesToChannel (int) override { return true; }
+};
+
+struct SimpleVoice : public juce::SynthesiserVoice
+{
+    SimpleVoice() {}
+
+    bool canPlaySound (juce::SynthesiserSound* s) override { return dynamic_cast<SimpleSound*>(s) != nullptr; }
+
+    void startNote (int midiNoteNumber, float velocity, juce::SynthesiserSound* /*sound*/, int /*currentPitchWheelPosition*/) override
+    {
+        level = velocity * 0.15f;
+        tailOff = 0.0f;
+        currentAngle = 0.0;
+        angleDelta = juce::MathConstants<double>::twoPi * juce::MidiMessage::getMidiNoteInHertz(midiNoteNumber) / getSampleRate();
+    }
+
+    void stopNote (float /*velocity*/, bool allowTailOff) override
+    {
+        if (allowTailOff)
+        {
+            if (tailOff == 0.0) // we only start a tail-off if it's not already doing so.
+                tailOff = 1.0;
+        }
+        else
+        {
+            clearCurrentNote();
+            angleDelta = 0.0;
+        }
+    }
+
+    void pitchWheelMoved (int) override {}
+    void controllerMoved (int, int) override {}
+
+    void renderNextBlock (juce::AudioBuffer<float>& outputBuffer, int startSample, int numSamples) override
+    {
+        if (angleDelta != 0.0)
+        {
+            if (tailOff > 0.0)
+            {
+                while (--numSamples >= 0)
+                {
+                    const float currentSample = (float) (std::sin (currentAngle) * level * tailOff);
+                    for (int i = outputBuffer.getNumChannels(); --i >= 0;)
+                        outputBuffer.addSample (i, startSample, currentSample);
+
+                    currentAngle += angleDelta;
+                    ++startSample;
+
+                    tailOff *= 0.99; // simple exponential tail
+                    if (tailOff <= 0.005)
+                    {
+                        clearCurrentNote();
+                        angleDelta = 0.0;
+                        break;
+                    }
+                }
+            }
+            else
+            {
+                while (--numSamples >= 0)
+                {
+                    const float currentSample = (float) (std::sin (currentAngle) * level);
+                    for (int i = outputBuffer.getNumChannels(); --i >= 0;)
+                        outputBuffer.addSample (i, startSample, currentSample);
+
+                    currentAngle += angleDelta;
+                    ++startSample;
+                }
+            }
+        }
+    }
+
+private:
+    double currentAngle = 0.0;
+    double angleDelta = 0.0;
+    double level = 0.0;
+    double tailOff = 0.0;
+};
+
+// AudioEngine implementation --------------------------------------------------
+
+AudioEngine* AudioEngine::getInstance()
+{
+    if (!instance) instance = new AudioEngine();
+    return instance;
+}
+
+AudioEngine::AudioEngine()
+{
+}
+
+AudioEngine::~AudioEngine()
+{
+    shutdown();
+}
+
+void AudioEngine::initialise()
+{
+    deviceManager.initialise(0, 2, nullptr, true);
+    deviceManager.addAudioCallback(this);
+
+    // Create default channels
+    for (int i = 0; i < 4; ++i)
+        addChannel();
+}
+
+void AudioEngine::shutdown()
+{
+    deviceManager.removeAudioCallback(this);
+    deviceManager.closeAudioDevice();
+
+    // cleanup
+    channels.clear();
+    sequence.clear();
+}
+
+void AudioEngine::start()
+{
+    juce::ScopedLock sl(lock);
+    isPlaying = true;
+    // reset sequence flags
+    for (auto& ev : sequence)
+    {
+        ev.onSent = false;
+        ev.offSent = false;
+    }
+}
+
+void AudioEngine::stop()
+{
+    juce::ScopedLock sl(lock);
+    isPlaying = false;
+    // send all noteOffs
+    for (auto& ch : channels)
+    {
+        ch.synth.allNotesOff(0, true);
+    }
+}
+
+void AudioEngine::setBpm(double b)
+{
+    juce::ScopedLock sl(lock);
+    bpm = b;
+}
+
+double AudioEngine::getBpm() const { return bpm; }
+
+int AudioEngine::addChannel()
+{
+    juce::ScopedLock sl(lock);
+    Channel ch;
+    ch.volume = 1.0f;
+    ch.mute = false;
+    ch.pan = 0.0f;
+    ch.solo = false;
+    ch.meterLevel = 0.0f;
+    // add 6 voices per channel
+    for (int v = 0; v < 6; ++v)
+        ch.synth.addVoice(new SimpleVoice());
+    ch.synth.addSound(new SimpleSound());
+    channels.add(std::move(ch));
+    return channels.size() - 1;
+}
+
+bool AudioEngine::removeChannel(int index)
+{
+    juce::ScopedLock sl(lock);
+    if (!isPositiveAndBelow(index, channels.size())) return false;
+    channels.remove(index);
+    return true;
+}
+
+int AudioEngine::getNumChannels() const
+{
+    return channels.size();
+}
+
+void AudioEngine::setChannelVolume(int index, float vol)
+{
+    juce::ScopedLock sl(lock);
+    if (isPositiveAndBelow(index, channels.size()))
+        channels.getReference(index).volume = vol;
+}
+
+float AudioEngine::getChannelVolume(int index) const
+{
+    if (isPositiveAndBelow(index, channels.size()))
+        return channels.getReference(index).volume;
+    return 1.0f;
+}
+
+void AudioEngine::setChannelMute(int index, bool m)
+{
+    juce::ScopedLock sl(lock);
+    if (isPositiveAndBelow(index, channels.size()))
+        channels.getReference(index).mute = m;
+}
+
+bool AudioEngine::getChannelMute(int index) const
+{
+    if (isPositiveAndBelow(index, channels.size()))
+        return channels.getReference(index).mute;
+    return false;
+}
+
+void AudioEngine::setChannelPan(int index, float pan)
+{
+    juce::ScopedLock sl(lock);
+    if (isPositiveAndBelow(index, channels.size()))
+        channels.getReference(index).pan = juce::jlimit(-1.0f, 1.0f, pan);
+}
+
+float AudioEngine::getChannelPan(int index) const
+{
+    if (isPositiveAndBelow(index, channels.size()))
+        return channels.getReference(index).pan;
+    return 0.0f;
+}
+
+void AudioEngine::setChannelSolo(int index, bool s)
+{
+    juce::ScopedLock sl(lock);
+    if (isPositiveAndBelow(index, channels.size()))
+        channels.getReference(index).solo = s;
+}
+
+bool AudioEngine::getChannelSolo(int index) const
+{
+    if (isPositiveAndBelow(index, channels.size()))
+        return channels.getReference(index).solo;
+    return false;
+}
+
+float AudioEngine::getChannelLevel(int index) const
+{
+    if (isPositiveAndBelow(index, channels.size()))
+        return channels.getReference(index).meterLevel;
+    return 0.0f;
+}
+
+void AudioEngine::addNoteEvent(const NoteEvent& ev)
+{
+    juce::ScopedLock sl(lock);
+    sequence.add(ev);
+}
+
+void AudioEngine::clearSequence()
+{
+    juce::ScopedLock sl(lock);
+    sequence.clear();
+}
+
+void AudioEngine::audioDeviceAboutToStart(juce::AudioIODevice* device)
+{
+    sampleRate = device->getCurrentSampleRate();
+    mixBuffer.setSize(device->getActiveOutputChannels().countNumberOfSetBits(), device->getCurrentBufferSizeSamples());
+
+    // initialize synth sample rates
+    for (auto& ch : channels)
+        ch.synth.setCurrentPlaybackSampleRate(sampleRate);
+}
+
+void AudioEngine::audioDeviceStopped()
+{
+    mixBuffer.setSize(0, 0);
+}
+
+static void computePanGains(float pan, float& leftGain, float& rightGain)
+{
+    // pan -1 = left, 0 = center, 1 = right
+    // use equal-power panning
+    float angle = (pan + 1.0f) * 0.25f * juce::MathConstants<float>::pi; // map [-1,1] to [0, pi/2]
+    leftGain = std::cos(angle);
+    rightGain = std::sin(angle);
+}
+
+void AudioEngine::audioDeviceIOCallback(const float** /*inputChannelData*/, int /*numInputChannels*/,
+                                        float** outputChannelData, int numOutputChannels,
+                                        int numSamples)
+{
+    // clear output
+    for (int ch = 0; ch < numOutputChannels; ++ch)
+        juce::FloatVectorOperations::clear(outputChannelData[ch], numSamples);
+
+    if (channels.size() == 0)
+        return;
+
+    // compute beat ranges
+    const double samplesPerBeat = (sampleRate * 60.0) / bpm;
+
+    // Lock sequence/channels while we process events
+    juce::ScopedLock sl(lock);
+
+    if (isPlaying)
+    {
+        // use member totalSamples so UI can query playhead
+        const double beatStart = (double)totalSamples / samplesPerBeat;
+        const double beatEnd = (double)(totalSamples + numSamples) / samplesPerBeat;
+
+        for (auto& ev : sequence)
+        {
+            if (!ev.onSent && ev.startBeat >= beatStart && ev.startBeat < beatEnd)
+            {
+                if (isPositiveAndBelow(ev.channel, channels.size()))
+                    channels.getReference(ev.channel).synth.noteOn(midiChannelForSynth, ev.midiNote, (juce::uint8)ev.velocity);
+                ev.onSent = true;
+            }
+            if (!ev.offSent && (ev.startBeat + ev.durationBeats) >= beatStart && (ev.startBeat + ev.durationBeats) < beatEnd)
+            {
+                if (isPositiveAndBelow(ev.channel, channels.size()))
+                    channels.getReference(ev.channel).synth.noteOff(midiChannelForSynth, ev.midiNote, (juce::uint8)0, true);
+                ev.offSent = true;
+            }
+        }
+
+        totalSamples += numSamples;
+
+        // handle looping
+        if (loopEnabled && loopEndBeat > loopStartBeat)
+        {
+            double currentBeat = (double)totalSamples / samplesPerBeat;
+            if (currentBeat >= loopEndBeat)
+            {
+                totalSamples = (int64_t)(loopStartBeat * samplesPerBeat);
+                // reset event flags so notes will trigger again in loop
+                for (auto& ev : sequence)
+                {
+                    ev.onSent = false;
+                    ev.offSent = false;
+                }
+            }
+        }
+    }
+
+    // render each channel into mixBuffer then copy to output with volume/pan/solo
+    mixBuffer.setSize(numOutputChannels, numSamples);
+    mixBuffer.clear();
+
+    // check if any solo active
+    bool anySolo = false;
+    for (auto& ch : channels) if (ch.solo) { anySolo = true; break; }
+
+    for (int i = 0; i < channels.size(); ++i)
+    {
+        auto& ch = channels.getReference(i);
+        juce::AudioBuffer<float> tempBuf(numOutputChannels, numSamples);
+        tempBuf.clear();
+
+        ch.synth.renderNextBlock(tempBuf, juce::MidiBuffer(), 0, numSamples);
+
+        float vol = ch.mute ? 0.0f : ch.volume;
+        if (anySolo && !ch.solo) vol = 0.0f;
+
+        float leftGain, rightGain;
+        computePanGains(ch.pan, leftGain, rightGain);
+
+        // compute RMS level for meter
+        double sumSquares = 0.0;
+
+        for (int s = 0; s < numSamples; ++s)
+        {
+            float inL = tempBuf.getNumChannels() > 0 ? tempBuf.getSample(0, s) : 0.0f;
+            float inR = tempBuf.getNumChannels() > 1 ? tempBuf.getSample(1, s) : inL;
+
+            float sampleL = (inL * leftGain + inR * leftGain) * vol;
+            float sampleR = (inL * rightGain + inR * rightGain) * vol;
+
+            if (numOutputChannels > 0) mixBuffer.addSample(0, s, sampleL);
+            if (numOutputChannels > 1) mixBuffer.addSample(1, s, sampleR);
+
+            float mono = 0.5f * (sampleL + sampleR);
+            sumSquares += (double)mono * (double)mono;
+        }
+
+        double rms = 0.0;
+        if (numSamples > 0) rms = std::sqrt(sumSquares / (double)numSamples);
+        ch.meterLevel = (float)rms;
+    }
+
+    // copy mixBuffer to outputChannelData
+    for (int c = 0; c < numOutputChannels; ++c)
+    {
+        auto* src = mixBuffer.getReadPointer(c);
+        auto* dst = outputChannelData[c];
+        for (int s = 0; s < numSamples; ++s)
+            dst[s] = src[s];
+    }
+}
+
+bool AudioEngine::saveProject(const juce::File& file)
+{
+    juce::ScopedLock sl(lock);
+    juce::DynamicObject::Ptr root = new juce::DynamicObject();
+    root->setProperty(""bpm"", bpm);
+
+    juce::Array<juce::var> chArr;
+    for (auto& ch : channels)
+    {
+        juce::DynamicObject::Ptr dob = new juce::DynamicObject();
+        dob->setProperty(""volume"", ch.volume);
+        dob->setProperty(""mute"", ch.mute);
+        dob->setProperty(""pan"", ch.pan);
+        dob->setProperty(""solo"", ch.solo);
+        chArr.add(juce::var(dob.get()));
+    }
+    root->setProperty(""channels"", juce::var(chArr));
+
+    juce::Array<juce::var> notesArr;
+    for (auto& ev : sequence)
+    {
+        juce::DynamicObject::Ptr n = new juce::DynamicObject();
+        n->setProperty(""channel"", ev.channel);
+        n->setProperty(""midiNote"", ev.midiNote);
+        n->setProperty(""velocity"", ev.velocity);
+        n->setProperty(""startBeat"", ev.startBeat);
+        n->setProperty(""durationBeats"", ev.durationBeats);
+        notesArr.add(juce::var(n.get()));
+    }
+    root->setProperty(""notes"", juce::var(notesArr));
+
+    juce::var top(root.get());
+    juce::String json = juce::JSON::toString(top);
+    return file.replaceWithText(json);
+}
+
+bool AudioEngine::loadProject(const juce::File& file)
+{
+    if (!file.existsAsFile()) return false;
+    juce::String json = file.loadFileAsString();
+    juce::var result = juce::JSON::parse(json);
+    if (auto* root = result.getDynamicObject())
+    {
+        juce::ScopedLock sl(lock);
+        if (root->hasProperty(""bpm"")) bpm = (double)root->getProperty(""bpm"");
+
+        channels.clearQuick();
+        if (root->hasProperty(""channels""))
+        {
+            auto chArr = root->getProperty(""channels"");
+            if (auto* arr = chArr.getArray())
+            {
+                for (auto& v : *arr)
+                {
+                    if (auto* dob = v.getDynamicObject())
+                    {
+                        Channel ch;
+                        ch.volume = (float)dob->getProperty(""volume"");
+                        ch.mute = (bool)dob->getProperty(""mute"");
+                        ch.pan = (float)dob->getProperty(""pan"");
+                        ch.solo = (bool)dob->getProperty(""solo"");
+                        ch.meterLevel = 0.0f;
+                        for (int v = 0; v < 6; ++v) ch.synth.addVoice(new SimpleVoice());
+                        ch.synth.addSound(new SimpleSound());
+                        channels.add(std::move(ch));
+                    }
+                }
+            }
+        }
+
+        sequence.clear();
+        if (root->hasProperty(""notes""))
+        {
+            auto notes = root->getProperty(""notes"");
+            if (auto* arr = notes.getArray())
+            {
+                for (auto& n : *arr)
+                {
+                    if (auto* dob = n.getDynamicObject())
+                    {
+                        NoteEvent ev;
+                        ev.channel = (int)dob->getProperty(""channel"");
+                        ev.midiNote = (int)dob->getProperty(""midiNote"");
+                        ev.velocity = (int)dob->getProperty(""velocity"");
+                        ev.startBeat = (double)dob->getProperty(""startBeat"");
+                        ev.durationBeats = (double)dob->getProperty(""durationBeats"");
+                        ev.onSent = ev.offSent = false;
+                        sequence.add(ev);
+                    }
+                }
+            }
+        }
+
+        return true;
+    }
+    return false;
+}
+
+double AudioEngine::getPlayheadBeat() const
+{
+    const double samplesPerBeat = (sampleRate * 60.0) / bpm;
+    return (double)totalSamples / samplesPerBeat;
+}
+
+void AudioEngine::setLoop(bool enabled, double startBeat, double endBeat)
+{
+    juce::ScopedLock sl(lock);
+    loopEnabled = enabled;
+    loopStartBeat = startBeat;
+    loopEndBeat = endBeat;
+}
+"@
+
+# Mixer files
+Write-FileContent "src/UI/Mixer.h" @"
+#pragma once
+
+#include <JuceHeader.h>
+
+class MixerComponent : public juce::Component, private juce::Timer
+{
+public:
+    MixerComponent();
+    void resized() override;
+    void refresh();
+    void timerCallback() override;
+
+private:
+    juce::OwnedArray<juce::Component> rows;
+    juce::Array<juce::ProgressBar*> meters;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MixerComponent)
+};
+"@
+
+Write-FileContent "src/UI/Mixer.cpp" @"
+#include ""Mixer.h""
+#include ""../AudioEngine.h""
+
+MixerComponent::MixerComponent()
+{
+    refresh();
+    startTimerHz(20); // update meters at 20 Hz
+}
+
+void MixerComponent::refresh()
+{
+    rows.clear();
+    removeAllChildren();
+    meters.clear();
+
+    auto* engine = AudioEngine::getInstance();
+    int nch = engine->getNumChannels();
+
+    for (int i = 0; i < nch; ++i)
+    {
+        auto* row = new juce::Component();
+        auto* vol = new juce::Slider();
+        vol->setSliderStyle(juce::Slider::LinearVertical);
+        vol->setRange(0.0, 1.0, 0.001);
+        vol->setValue(engine->getChannelVolume(i));
+        row->addAndMakeVisible(vol);
+
+        auto* pan = new juce::Slider();
+        pan->setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
+        pan->setRange(-1.0, 1.0, 0.01);
+        pan->setValue(engine->getChannelPan(i));
+        row->addAndMakeVisible(pan);
+
+        auto* solo = new juce::ToggleButton(""S"");
+        solo->setToggleState(engine->getChannelSolo(i), juce::dontSendNotification);
+        row->addAndMakeVisible(solo);
+
+        auto* meter = new juce::ProgressBar(engine->getChannelLevel(i));
+        row->addAndMakeVisible(meter);
+        meters.add(meter);
+
+        int idx = i;
+        vol->onValueChange = [vol, idx]() { AudioEngine::getInstance()->setChannelVolume(idx, (float)vol->getValue()); };
+        pan->onValueChange = [pan, idx]() { AudioEngine::getInstance()->setChannelPan(idx, (float)pan->getValue()); };
+        solo->onClick = [solo, idx]() { AudioEngine::getInstance()->setChannelSolo(idx, solo->getToggleState()); };
+
+        rows.add(row);
+        addAndMakeVisible(row);
+    }
+}
+
+void MixerComponent::resized()
+{
+    auto r = getLocalBounds().reduced(6);
+    int colW = 80;
+    int x = r.getX();
+    for (int i = 0; i < rows.size(); ++i)
+    {
+        rows[i]->setBounds(x, r.getY(), colW, r.getHeight());
+        auto* row = rows[i];
+        auto c = row->getLocalBounds();
+        if (auto* vol = dynamic_cast<juce::Slider*>(row->getChildComponent(0)))
+            vol->setBounds(c.removeFromTop(c.getHeight() - 60).reduced(8));
+        if (auto* meter = dynamic_cast<juce::ProgressBar*>(row->getChildComponent(1)))
+            meter->setBounds(c.removeFromTop(16).reduced(8));
+        if (auto* pan = dynamic_cast<juce::Slider*>(row->getChildComponent(2)))
+            pan->setBounds(c.removeFromTop(44).reduced(8));
+        if (auto* solo = dynamic_cast<juce::ToggleButton*>(row->getChildComponent(3)))
+            solo->setBounds(c.removeFromTop(24).reduced(8).removeFromLeft(24));
+
+        x += colW + 6;
+    }
+}
+
+void MixerComponent::timerCallback()
+{
+    auto* engine = AudioEngine::getInstance();
+    for (int i = 0; i < meters.size(); ++i)
+    {
+        float val = engine->getChannelLevel(i);
+        meters[i]->setCurrentValue(val);
+    }
+}
+"@
+
+# Channel rack, transport, piano roll updates
+Write-FileContent "src/UI/ChannelRack.cpp" @"
+#include ""ChannelRack.h""
+#include ""../AudioEngine.h""
+
+ChannelRackComponent::ChannelRackComponent()
+{
+    auto* engine = AudioEngine::getInstance();
+    int nch = engine->getNumChannels();
+
+    auto* addBtn = new juce::TextButton(""Add Channel"");
+    addAndMakeVisible(addBtn);
+    addBtn->onClick = [this]() {
+        AudioEngine::getInstance()->addChannel();
+        # Recreate UI rows
+        removeAllChildren();
+        channelRows.clearQuick();
+        int nch = AudioEngine::getInstance()->getNumChannels();
+        for (int i = 0; i < nch; ++i)
+        {
+            auto* row = new juce::Component();
+            auto* label = new juce::Label();
+            label->setText(""Channel "" + juce::String(i+1), juce::dontSendNotification);
+            row->addAndMakeVisible(label);
+
+            auto* vol = new juce::Slider();
+            vol->setRange(0.0, 1.0, 0.01);
+            vol->setValue(AudioEngine::getInstance()->getChannelVolume(i));
+            row->addAndMakeVisible(vol);
+
+            auto* mute = new juce::ToggleButton(""Mute"");
+            mute->setToggleState(AudioEngine::getInstance()->getChannelMute(i), juce::dontSendNotification);
+            row->addAndMakeVisible(mute);
+
+            int idx = i;
+            vol->onValueChange = [vol, idx]() { AudioEngine::getInstance()->setChannelVolume(idx, (float)vol->getValue()); };
+            mute->onClick = [mute, idx]() { AudioEngine::getInstance()->setChannelMute(idx, mute->getToggleState()); };
+
+            channelRows.add(row);
+            addAndMakeVisible(row);
+        }
+    };
+
+    for (int i = 0; i < nch; ++i)
+    {
+        auto* row = new juce::Component();
+        auto* label = new juce::Label();
+        label->setText(""Channel "" + juce::String(i+1), juce::dontSendNotification);
+        row->addAndMakeVisible(label);
+
+        auto* vol = new juce::Slider();
+        vol->setRange(0.0, 1.0, 0.01);
+        vol->setValue(AudioEngine::getInstance()->getChannelVolume(i));
+        row->addAndMakeVisible(vol);
+
+        auto* mute = new juce::ToggleButton(""Mute"");
+        mute->setToggleState(AudioEngine::getInstance()->getChannelMute(i), juce::dontSendNotification);
+        row->addAndMakeVisible(mute);
+
+        int idx = i;
+        vol->onValueChange = [vol, idx]() { AudioEngine::getInstance()->setChannelVolume(idx, (float)vol->getValue()); };
+        mute->onClick = [mute, idx]() { AudioEngine::getInstance()->setChannelMute(idx, mute->getToggleState()); };
+
+        channelRows.add(row);
+        addAndMakeVisible(row);
+    }
+}
+
+void ChannelRackComponent::resized()
+{
+    auto r = getLocalBounds();
+    int rowH = 36;
+    for (int i = 0; i < channelRows.size(); ++i)
+    {
+        channelRows[i]->setBounds(0, i * rowH, getWidth(), rowH - 2);
+        auto* row = channelRows[i];
+        auto c = row->getLocalBounds();
+        if (auto* label = dynamic_cast<juce::Label*>(row->getChildComponent(0)))
+            label->setBounds(c.removeFromLeft(100).reduced(4));
+        if (auto* vol = dynamic_cast<juce::Slider*>(row->getChildComponent(1)))
+            vol->setBounds(c.removeFromLeft(150).reduced(4));
+        if (auto* mute = dynamic_cast<juce::ToggleButton*>(row->getChildComponent(2)))
+            mute->setBounds(c.removeFromLeft(80).reduced(6));
+    }
+}
+"@
+
+Write-FileContent "src/UI/Transport.h" @"
+#pragma once
+#include <JuceHeader.h>
+
+class TransportComponent : public juce::Component, private juce::Timer
+{
+public:
+    TransportComponent();
+    void resized() override;
+    void timerCallback() override;
+
+private:
+    juce::TextButton playButton;
+    juce::TextButton stopButton;
+    juce::Label bpmLabel;
+    juce::Slider bpmSlider;
+    juce::TextButton saveButton;
+    juce::TextButton loadButton;
+
+    juce::ToggleButton loopToggle;
+    juce::Label playheadLabel;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(TransportComponent)
+};
+"@
+
+Write-FileContent "src/UI/Transport.cpp" @"
+#include ""Transport.h""
+#include ""../AudioEngine.h""
+
+TransportComponent::TransportComponent()
+{
+    addAndMakeVisible(playButton);
+    addAndMakeVisible(stopButton);
+    addAndMakeVisible(bpmLabel);
+    addAndMakeVisible(bpmSlider);
+    addAndMakeVisible(saveButton);
+    addAndMakeVisible(loadButton);
+    addAndMakeVisible(playheadLabel);
+    addAndMakeVisible(loopToggle);
+
+    playButton.setButtonText(""Play"");
+    stopButton.setButtonText(""Stop"");
+    saveButton.setButtonText(""Save"");
+    loadButton.setButtonText(""Load"");
+
+    bpmLabel.setText(""BPM"", juce::dontSendNotification);
+    bpmSlider.setRange(40, 240, 1);
+    bpmSlider.setValue(AudioEngine::getInstance()->getBpm());
+
+    playButton.onClick = []() { AudioEngine::getInstance()->start(); };
+    stopButton.onClick = []() { AudioEngine::getInstance()->stop(); };
+
+    bpmSlider.onValueChange = [this]() { AudioEngine::getInstance()->setBpm(bpmSlider.getValue()); };
+
+    saveButton.onClick = [this]() {
+        juce::FileChooser fc(""Save project..."");
+        if (fc.browseForFileToSave(true))
+        {
+            auto f = fc.getResult();
+            AudioEngine::getInstance()->saveProject(f);
+        }
+    };
+
+    loadButton.onClick = [this]() {
+        juce::FileChooser fc(""Load project..."");
+        if (fc.browseForFileToOpen())
+        {
+            auto f = fc.getResult();
+            AudioEngine::getInstance()->loadProject(f);
+            bpmSlider.setValue(AudioEngine::getInstance()->getBpm());
+        }
+    };
+
+    loopToggle.setButtonText(""Loop"");
+    loopToggle.onClick = [this]() {
+        if (loopToggle.getToggleState())
+            AudioEngine::getInstance()->setLoop(true, 0.0, 4.0); # example loop 0-4 beats
+        else
+            AudioEngine::getInstance()->setLoop(false, 0.0, 0.0);
+    };
+
+    startTimerHz(10);
+}
+
+void TransportComponent::resized()
+{
+    auto r = getLocalBounds().reduced(6);
+    playButton.setBounds(r.removeFromLeft(80));
+    stopButton.setBounds(r.removeFromLeft(80));
+    saveButton.setBounds(r.removeFromLeft(80));
+    loadButton.setBounds(r.removeFromLeft(80));
+
+    bpmLabel.setBounds(r.removeFromLeft(40));
+    bpmSlider.setBounds(r.removeFromLeft(120));
+
+    loopToggle.setBounds(r.removeFromLeft(60));
+    playheadLabel.setBounds(r.removeFromLeft(140));
+}
+
+void TransportComponent::timerCallback()
+{
+    double beat = AudioEngine::getInstance()->getPlayheadBeat();
+    playheadLabel.setText(""Beat: "" + juce::String(beat, 3), juce::dontSendNotification);
+}
+"@
+
+Write-FileContent "src/UI/PianoRoll.h" @"
+#pragma once
+#include <JuceHeader.h>
+
+class PianoRollComponent : public juce::Component
+{
+public:
+    PianoRollComponent();
+    void paint(juce::Graphics& g) override;
+    void resized() override;
+    void mouseDown(const juce::MouseEvent& e) override;
+    void mouseDrag(const juce::MouseEvent& e) override;
+    void mouseUp(const juce::MouseEvent& e) override;
+
+    struct NoteVisual { double startBeat; double duration; int midiNote; int channel; };
+    juce::Array<NoteVisual> notes;
+
+private:
+    int selectedNote = -1;
+    juce::Point<int> mouseDragLast;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(PianoRollComponent)
+};
+"@
+
+Write-FileContent "src/UI/PianoRoll.cpp" @"
+#include ""PianoRoll.h""
+#include ""../AudioEngine.h""
+
+PianoRollComponent::PianoRollComponent()
+{
+}
+
+void PianoRollComponent::paint(juce::Graphics& g)
+{
+    g.fillAll(juce::Colours::darkslategrey);
+    g.setColour(juce::Colours::white);
+
+    // draw grid for 16 beats and 12 notes
+    int beats = 16;
+    int keys = 12;
+    auto r = getLocalBounds().toFloat();
+    for (int b = 0; b <= beats; ++b)
+    {
+        float x = r.getX() + (r.getWidth() * b / beats);
+        g.drawLine(x, r.getY(), x, r.getBottom(), 1.0f);
+    }
+    for (int k = 0; k <= keys; ++k)
+    {
+        float y = r.getY() + (r.getHeight() * k / keys);
+        g.drawLine(r.getX(), y, r.getRight(), y, 1.0f);
+    }
+
+    // draw notes
+    g.setColour(juce::Colours::orange);
+    for (int i = 0; i < notes.size(); ++i)
+    {
+        auto& n = notes.getReference(i);
+        float x = (float)(getWidth() * (n.startBeat / 16.0));
+        float w = (float)(getWidth() * (n.duration / 16.0));
+        float y = (float)(getHeight() * ((127 - n.midiNote) / 12.0));
+        g.fillRect(x, y, w, 12);
+
+        if (i == selectedNote)
+        {
+            g.setColour(juce::Colours::yellow);
+            g.drawRect(x, y, w, 12, 2);
+        }
+    }
+}
+
+void PianoRollComponent::resized()
+{
+}
+
+void PianoRollComponent::mouseDown(const juce::MouseEvent& e)
+{
+    // detect click on existing note
+    for (int i = 0; i < notes.size(); ++i)
+    {
+        auto& n = notes.getReference(i);
+        float x = (float)(getWidth() * (n.startBeat / 16.0));
+        float w = (float)(getWidth() * (n.duration / 16.0));
+        float y = (float)(getHeight() * ((127 - n.midiNote) / 12.0));
+        juce::Rectangle<float> r(x, y, w, 12);
+        if (r.contains((float)e.x, (float)e.y))
+        {
+            selectedNote = i;
+            mouseDragLast = e.getPosition();
+            repaint();
+            if (e.mods.isRightButtonDown())
+            {
+                # delete on right click
+                notes.remove(i);
+                # also remove from engine sequence - simple linear search
+                auto seq = AudioEngine::getInstance();
+                juce::Array<int> toRemove;
+                for (int si = 0; si < seq->sequence.size(); ++si)
+                {
+                    auto& ev = seq->sequence.getReference(si);
+                    if (ev.midiNote == n.midiNote && ev.startBeat == n.startBeat)
+                    {
+                        toRemove.add(si);
+                        break;
+                    }
+                }
+                for (int ri = toRemove.size()-1; ri -ge 0; --ri)
+                    seq->sequence.remove(toRemove[ri]);
+
+                selectedNote = -1;
+                repaint();
+            }
+            return;
+        }
+    }
+
+    # convert mouse x to beat, y to midi note
+    double beat = (double)e.x / (double)getWidth() * 16.0;
+    int midi = 72 - (int)((double)e.y / (double)getHeight() * 12.0);
+    if (midi < 0) midi = 0; if (midi > 127) midi = 127;
+
+    NoteVisual nv;
+    nv.startBeat = std::floor(beat);
+    nv.duration = 1.0;
+    nv.midiNote = midi;
+    nv.channel = 0; # default channel 0
+    notes.add(nv);
+
+    # add to AudioEngine sequence
+    AudioEngine::NoteEvent ev;
+    ev.channel = nv.channel;
+    ev.midiNote = nv.midiNote;
+    ev.velocity = 100;
+    ev.startBeat = nv.startBeat;
+    ev.durationBeats = nv.duration;
+    ev.onSent = ev.offSent = false;
+    AudioEngine::getInstance()->addNoteEvent(ev);
+
+    repaint();
+}
+
+void PianoRollComponent::mouseDrag(const juce::MouseEvent& e)
+{
+    if (selectedNote >= 0 && selectedNote < notes.size())
+    {
+        auto delta = e.getPosition() - mouseDragLast;
+        double beatDelta = (double)delta.x / (double)getWidth() * 16.0;
+        int noteDelta = -(int)((double)delta.y / (double)getHeight() * 12.0);
+
+        auto& n = notes.getReference(selectedNote);
+        n.startBeat += beatDelta;
+        n.midiNote += noteDelta;
+        if (n.startBeat < 0) n.startBeat = 0;
+        if (n.midiNote < 0) n.midiNote = 0;
+        if (n.midiNote > 127) n.midiNote = 127;
+
+        # update corresponding sequence event (simple match by original characteristics)
+        auto seq = AudioEngine::getInstance();
+        for (int si = 0; si < seq->sequence.size(); ++si)
+        {
+            auto& ev = seq->sequence.getReference(si);
+            if (ev.midiNote == n.midiNote && std::abs(ev.startBeat - n.startBeat - beatDelta) < 0.001)
+            {
+                ev.startBeat = n.startBeat;
+                ev.midiNote = n.midiNote;
+                break;
+            }
+        }
+
+        mouseDragLast = e.getPosition();
+        repaint();
+    }
+}
+
+void PianoRollComponent::mouseUp(const juce::MouseEvent& e)
+{
+    selectedNote = -1;
+}
+"@
+
+# Git add/commit/push
+Write-Host "Preparing git commit on branch $branch..."
+# fetch current branches
+git rev-parse --is-inside-work-tree > $null 2>&1
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "Not inside a git repository. Run this script from the repo root."
+    exit 1
+}
+
+git fetch origin
+
+# create or checkout branch
+$localBranches = git branch --list $branch
+if (![string]::IsNullOrWhiteSpace($localBranches)) {
+    git checkout $branch
+} else {
+    git checkout -b $branch
+}
+
+git add -A
+$commitMessage = "Add mixer meters, dynamic channels, playhead/loop, piano roll editing and Windows CI"
+git commit -m $commitMessage
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "Commit failed. There may be no changes staged or git reported an error."
+    exit 1
+}
+
+git push -u origin $branch
+if ($LASTEXITCODE -eq 0) {
+    Write-Host "Pushed branch $branch to origin. Open a PR from init-juce-daw -> main in GitHub to review."
+} else {
+    Write-Error "Push failed. Check your credentials and network access."
+    exit 1
+  }
