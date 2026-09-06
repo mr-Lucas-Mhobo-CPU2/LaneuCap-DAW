@@ -4,12 +4,14 @@
 class PianoRollComponent : public juce::Component
 {
 public:
-    PianoRollComponent()
-    {
-        addAndMakeVisible(label);
-        label.setText("Piano Roll", juce::dontSendNotification);
-    }
-    void resized() override { label.setBounds(5,5,getWidth()-10,20); }
+    PianoRollComponent();
+    void paint(juce::Graphics& g) override;
+    void resized() override;
+    void mouseDown(const juce::MouseEvent& e) override;
+
 private:
-    juce::Label label;
+    struct NoteVisual { double startBeat; double duration; int midiNote; int channel; };
+    juce::Array<NoteVisual> notes;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(PianoRollComponent)
 };

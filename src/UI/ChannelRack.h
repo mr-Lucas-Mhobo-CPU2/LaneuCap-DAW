@@ -4,12 +4,18 @@
 class ChannelRackComponent : public juce::Component
 {
 public:
-    ChannelRackComponent()
-    {
-        addAndMakeVisible(label);
-        label.setText("Channel Rack", juce::dontSendNotification);
-    }
-    void resized() override { label.setBounds(5,5,getWidth()-10,20); }
+    ChannelRackComponent();
+    void resized() override;
+
 private:
-    juce::Label label;
+    struct ChannelControls
+    {
+        juce::Label name;
+        juce::Slider volume;
+        juce::ToggleButton mute;
+    };
+
+    juce::OwnedArray<juce::Component> channelRows;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(ChannelRackComponent)
 };
